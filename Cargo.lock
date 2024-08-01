@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "nixpacks"
-version = "1.24.6"
+version = "1.26.0"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -1626,6 +1626,10 @@ dependencies = [
  "globset",
  "proc-macro2",
  "quote",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "serde_yaml",
  "walkdir",
 ]
 
