@@ -23,6 +23,8 @@ jobs:
 
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
@@ -50,6 +52,8 @@ jobs:
 
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
@@ -77,6 +81,7 @@ jobs:
   test-plan:
     name: Test Suite
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -91,6 +96,8 @@ jobs:
 
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
@@ -111,13 +118,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         # generate list of tests in json format for test-docker
         run: |
-          echo "::set-output name=matrix::{\"tests\":[\"$(cargo test -q --package nixpacks --test docker_run_tests -- --list --format=terse | sed -z 's/: test\n/\", \"/g' | sed 's/...$//')]}"
+          echo "matrix={\"tests\":[\"$(cargo test -q --package nixpacks --test docker_run_tests -- --list --format=terse | sed -z 's/: test\n/\", \"/g' | sed 's/...$//')]}" >> $GITHUB_OUTPUT
 
   test-docker:
     needs: test-plan
     name: Docker Tests
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix: ${{fromJson(needs.test-plan.outputs.matrix)}}
     if: "!contains(github.event.head_commit.message, '(cargo-release)')"
     steps:
@@ -128,6 +136,8 @@ jobs:
 
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
@@ -167,12 +177,14 @@ jobs:
 
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install 1.60 rust toolchain
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: 1.60.0
+          toolchain: 1.70.0
           override: true
 
       - uses: Swatinem/rust-cache@v2
@@ -195,6 +207,8 @@ jobs:
 
       - name: Checkout sources
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main

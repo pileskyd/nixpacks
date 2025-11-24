@@ -13,7 +13,10 @@ use super::{NodeProvider, PackageJson};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TurboJson {
+    #[serde(default)]
     pub pipeline: HashMap<String, Value>,
+    #[serde(default)]
+    pub tasks: HashMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -39,7 +42,7 @@ impl Turborepo {
     }
 
     fn get_pipeline_cmd(cfg: &TurboJson, name: &str) -> Option<String> {
-        if cfg.pipeline.contains_key(name) {
+        if cfg.pipeline.contains_key(name) || cfg.tasks.contains_key(name) {
             Some(format!("npx turbo run {name}"))
         } else {
             None
@@ -60,7 +63,8 @@ impl Turborepo {
             return Ok(Some(build_cmd));
         } else if let Some(app_name) = Turborepo::get_app_name(env) {
             return Ok(Some(format!("{dlx} turbo run {app_name}:build")));
-        };
+        }
+
         Ok(None)
     }
 
@@ -97,7 +101,7 @@ impl Turborepo {
                     format!("{pkg_manager} --workspace {name} run start")
                 }));
             }
-            println!("Warning: Turborepo app `{name}` not found");
+            eprintln!("Warning: Turborepo app `{name}` not found");
         }
         if let Some(start_pipeline) = Turborepo::get_start_cmd(&turbo_cfg) {
             return Ok(Some(start_pipeline));

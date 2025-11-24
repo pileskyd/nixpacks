@@ -12,7 +12,6 @@ use crate::nixpacks::{
 };
 use anyhow::{bail, Context, Ok, Result};
 use std::{
-    env,
     fs::{self, remove_dir_all, File},
     process::Command,
 };
@@ -144,10 +143,6 @@ impl DockerImageBuilder {
     ) -> Result<Command> {
         let mut docker_build_cmd = Command::new("docker");
 
-        if docker_build_cmd.output().is_err() {
-            bail!("Please install Docker to build the app https://docs.docker.com/engine/install/")
-        }
-
         // Enable BuildKit for all builds
         docker_build_cmd.env("DOCKER_BUILDKIT", "1");
 
@@ -155,12 +150,20 @@ impl DockerImageBuilder {
             .arg("build")
             .arg(&output.root)
             .arg("-f")
-            .arg(&output.get_absolute_path("Dockerfile"))
+            .arg(output.get_absolute_path("Dockerfile"))
             .arg("-t")
             .arg(name);
 
         if self.options.verbose {
             docker_build_cmd.arg("--progress=plain");
+        }
+
+        if !self.options.add_host.is_empty() {
+            for host in &self.options.add_host {
+                docker_build_cmd.arg("--add-host").arg(host);
+            }
+
+            docker_build_cmd.arg("--network").arg("host");
         }
 
         if self.options.quiet {
@@ -175,16 +178,22 @@ impl DockerImageBuilder {
             docker_build_cmd.arg("--cache-from").arg(value);
         }
 
+        if !self.options.docker_output.is_empty() {
+            for output in &self.options.docker_output {
+                docker_build_cmd.arg("--output").arg(output);
+            }
+        }
+
         if let Some(value) = &self.options.docker_host {
-            env::set_var("DOCKER_HOST", value);
+            docker_build_cmd.env("DOCKER_HOST", value);
         }
 
         if let Some(value) = &self.options.docker_tls_verify {
-            if value == "1" {
-                env::set_var("DOCKER_TLS_VERIFY", value);
-            } else {
-                env::remove_var("DOCKER_TLS_VERIFY"); // Clear the variable to disable TLS verification
-            }
+            docker_build_cmd.env("DOCKER_TLS_VERIFY", value);
+        }
+
+        if let Some(value) = &self.options.docker_cert_path {
+            docker_build_cmd.env("DOCKER_CERT_PATH", value);
         }
 
         if self.options.inline_cache {

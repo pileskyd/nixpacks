@@ -15,12 +15,26 @@ use crate::nixpacks::{
 use super::{node::NodeProvider, Provider};
 use anyhow::Result;
 
-const DEFAULT_PHP_VERSION: &str = "8.2";
+const LEGACY_ARCHIVE_VERSION: &str = "5148520bfab61f99fd25fb9ff7bfbb50dad3c9db";
+
+const DEFAULT_ARCHIVE_VERSION: &str = "e24b4c09e963677b1beea49d411cd315a024ad3a";
+
+const DEFAULT_PHP_VERSION: &str = "8.3";
+
+// (php_version, (nix_pkg_name, archive_version))
+const PHP_ARCHIVE_VERSIONS: &[(&str, (&str, &str))] = &[
+    ("7.4", ("php74", LEGACY_ARCHIVE_VERSION)),
+    ("8.0", ("php80", LEGACY_ARCHIVE_VERSION)),
+    ("8.1", ("php81", DEFAULT_ARCHIVE_VERSION)),
+    ("8.2", ("php", DEFAULT_ARCHIVE_VERSION)),
+    ("8.3", ("php83", DEFAULT_ARCHIVE_VERSION)),
+    ("8.4", ("php84", DEFAULT_ARCHIVE_VERSION)),
+];
 
 pub struct PhpProvider;
 
 impl Provider for PhpProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "php"
     }
 
@@ -51,10 +65,7 @@ impl Provider for PhpProvider {
 
 impl PhpProvider {
     fn get_setup(app: &App, env: &Environment) -> Result<Phase> {
-        let php_pkg = match PhpProvider::get_php_package(app) {
-            Ok(php_package) => php_package,
-            _ => "php".to_string(),
-        };
+        let (php_pkg, archive_version) = PhpProvider::get_php_package_and_archive(app)?;
 
         let mut php_extensions = PhpProvider::get_php_extensions(app).unwrap_or_default();
         php_extensions.sort_unstable();
@@ -87,6 +98,7 @@ impl PhpProvider {
 
         let mut phase = Phase::setup(Some(pkgs));
 
+        phase.set_nix_archive(archive_version.to_string());
         phase.add_pkgs_libs(ext_pkgs);
         phase.add_pkgs_libs(vec!["libmysqlclient".into()]);
 
@@ -99,7 +111,7 @@ impl PhpProvider {
         ));
         if app.includes_file("composer.json") {
             install.add_cmd("composer install --ignore-platform-reqs".to_string());
-        };
+        }
         if app.includes_file("package.json") {
             if let Some(install_cmd) = NodeProvider::get_install_command(app) {
                 install.add_cmd(install_cmd);
@@ -171,9 +183,14 @@ impl PhpProvider {
         vars
     }
 
-    fn get_php_package(app: &App) -> Result<String> {
-        let version = PhpProvider::get_php_version(app)?;
-        Ok(format!("php{}", version.replace('.', "")))
+    fn get_php_package_and_archive(app: &App) -> Result<(&str, &str)> {
+        let version = PhpProvider::get_php_version(app).unwrap_or(DEFAULT_PHP_VERSION.to_string());
+        let (_, (pkg, archive)) = PHP_ARCHIVE_VERSIONS
+            .iter()
+            .find(|(php_version, _)| version == *php_version)
+            .ok_or(anyhow::anyhow!("Unsupported PHP version: {}", version))?;
+
+        Ok((pkg, archive))
     }
 
     fn get_php_version(app: &App) -> Result<String> {
@@ -189,16 +206,18 @@ impl PhpProvider {
                 "8.2".to_string()
             } else if v.contains("8.3") {
                 "8.3".to_string()
+            } else if v.contains("8.4") {
+                "8.4".to_string()
             } else if v.contains("7.4") {
                 "7.4".to_string()
             } else {
-                println!(
+                eprintln!(
                     "Warning: PHP version {v} is not available, using PHP {DEFAULT_PHP_VERSION}"
                 );
                 DEFAULT_PHP_VERSION.to_string()
             }
         } else {
-            println!("Warning: No PHP version specified, using PHP {DEFAULT_PHP_VERSION}; see https://getcomposer.org/doc/04-schema.md#package-links for how to specify a PHP version.");
+            eprintln!("Warning: No PHP version specified, using PHP {DEFAULT_PHP_VERSION}; see https://getcomposer.org/doc/04-schema.md#package-links for how to specify a PHP version.");
             DEFAULT_PHP_VERSION.to_string()
         };
 
@@ -209,9 +228,13 @@ impl PhpProvider {
         let composer_json: ComposerJson = app.read_json("composer.json")?;
         let version = PhpProvider::get_php_version(app)?;
         let mut extensions = Vec::new();
+        // ext-json is included by default in PHP >= 8.0 (and not available in Nix)
+        // ext-zend-opcache is included by default in PHP >= 5.5
+        let ignored_extensions = [String::from("ext-json"), String::from("ext-zend-opcache")];
         for extension in composer_json.require.keys() {
-            // ext-json is included by default in PHP >= 8.0 (and not available in Nix) so skip over it
-            if extension.starts_with("ext-") && (version == "7.4" || extension != "ext-json") {
+            if extension.starts_with("ext-")
+                && (version == "7.4" || !ignored_extensions.contains(extension))
+            {
                 extensions.push(
                     extension
                         .strip_prefix("ext-")

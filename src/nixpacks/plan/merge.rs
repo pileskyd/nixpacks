@@ -47,7 +47,7 @@ impl Mergeable for BuildPlan {
                         phase.depends_on_phase("setup");
                     } else if name == "build" {
                         phase.depends_on_phase("install");
-                    };
+                    }
 
                     phase
                 });
@@ -55,7 +55,7 @@ impl Mergeable for BuildPlan {
                 let merged_phase = Phase::merge(&phase, &c2_phase);
                 new_plan.add_phase(merged_phase);
             }
-        };
+        }
 
         new_plan.start_phase = match (new_plan.start_phase, plan2.start_phase) {
             (None, s) | (s, None) => s,
@@ -101,6 +101,7 @@ impl Mergeable for StartPhase {
             start_phase.only_include_files.clone(),
             c2.only_include_files,
         );
+        start_phase.user = c2.user.or_else(|| start_phase.user.clone());
         start_phase
     }
 }

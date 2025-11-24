@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use nixpacks::{
     create_docker_image,
     nixpacks::{
-        builder::docker::DockerBuilderOptions, environment::EnvironmentVariables,
-        plan::generator::GeneratePlanOptions,
+        builder::docker::docker_helper::DockerHelper, builder::docker::DockerBuilderOptions,
+        environment::EnvironmentVariables, plan::generator::GeneratePlanOptions,
     },
 };
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::str;
 use std::time::Duration;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
@@ -123,6 +124,46 @@ async fn run_image(name: &str, cfg: Option<Config>) -> String {
         .join("\n")
 }
 
+async fn build_with_hosts(path: &str, add_hosts: &[String], nginx_host: String) -> String {
+    let name = Uuid::new_v4().to_string();
+    let mut env: Vec<&str> = Vec::new();
+    let env_var = format!("REMOTE_URL=http://{nginx_host}");
+    env.push(&*env_var);
+
+    create_docker_image(
+        path,
+        env,
+        &GeneratePlanOptions::default(),
+        &DockerBuilderOptions {
+            name: Some(name.clone()),
+            quiet: true,
+            add_host: add_hosts.to_owned(),
+
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    name
+}
+
+async fn build_with_env(path: &str, env: Vec<&str>) -> anyhow::Result<()> {
+    let name = Uuid::new_v4().to_string();
+
+    create_docker_image(
+        path,
+        env,
+        &GeneratePlanOptions::default(),
+        &DockerBuilderOptions {
+            name: Some(name.clone()),
+            quiet: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 /// Builds a directory with default options
 /// Returns the randomly generated image name
 async fn simple_build(path: &str) -> Result<String> {
@@ -161,6 +202,7 @@ async fn build_with_build_time_env_vars(path: &str, env_vars: Vec<&str>) -> Resu
 
 const POSTGRES_IMAGE: &str = "postgres";
 const MYSQL_IMAGE: &str = "mysql";
+const NGINX_IMAGE: &str = "nginx";
 
 struct Network {
     name: String,
@@ -338,6 +380,41 @@ fn run_mysql() -> Container {
     }
 }
 
+fn run_nginx() -> Container {
+    let mut docker_cmd = Command::new("docker");
+
+    let hash = Uuid::new_v4().to_string();
+    let container_name = format!("nginx-{hash}");
+
+    // run
+    docker_cmd.arg("run");
+
+    // Run detached
+    docker_cmd.arg("-d");
+
+    // attach name
+    docker_cmd.arg("--name").arg(container_name.clone());
+
+    // Assign image
+    docker_cmd.arg(NGINX_IMAGE);
+
+    // Run the command
+    docker_cmd
+        .spawn()
+        .unwrap()
+        .wait()
+        .context("Building nginx")
+        .unwrap();
+
+    Container {
+        name: container_name.clone(),
+        config: Some(Config {
+            environment_variables: EnvironmentVariables::from([]),
+            network: None,
+        }),
+    }
+}
+
 #[tokio::test]
 async fn test_deno() {
     let name = simple_build("./examples/deno").await.unwrap();
@@ -502,6 +579,102 @@ async fn test_node_moon_custom_start() {
     assert!(run_image(&name, None)
         .await
         .contains("ready - started server on 0.0.0.0:3000"));
+}
+
+#[tokio::test]
+async fn test_pnpm_network_call_working_with_add_hosts() {
+    // Create the network
+    let n = create_network();
+    let network_name = n.name.clone();
+
+    // Create the nginx instance
+    let c = run_nginx();
+    let container_name = c.name.clone();
+
+    // Attach the postgres instance to the network
+    attach_container_to_network(n.name, container_name.clone());
+
+    let containers = DockerHelper::containers_in_network(&network_name);
+
+    if containers.is_err() {
+        panic!("Failed to fetch containers in network");
+    }
+
+    let mut vec_hosts = Vec::new();
+
+    for (_, containerinfo) in containers.unwrap() {
+        let add_host = format!(
+            "{}:{}",
+            containerinfo.name, containerinfo.ipv4_address_without_mask
+        );
+        vec_hosts.push(add_host);
+    }
+
+    // Build the basic example, a function that calls the database
+    let name = build_with_hosts(
+        "./examples/node-fetch-network",
+        &vec_hosts,
+        container_name.clone(),
+    )
+    .await;
+
+    // Run the example on the attached network
+    let output = run_image(
+        &name,
+        Some(Config {
+            environment_variables: c.config.unwrap().environment_variables,
+            network: Some(network_name.clone()),
+        }),
+    )
+    .await;
+
+    // Cleanup containers and networks
+    stop_and_remove_container(container_name);
+    remove_network(network_name);
+
+    assert!(output.contains("Fetched data: OK"));
+}
+
+#[tokio::test]
+async fn test_pnpm_network_call_should_not_work_without_hosts() {
+    // Create the network
+    let n = create_network();
+    let network_name = n.name.clone();
+
+    // Create the nginx instance
+    let c = run_nginx();
+    let container_name = c.name.clone();
+
+    // Attach the postgres instance to the network
+    attach_container_to_network(n.name, container_name.clone());
+
+    let containers = DockerHelper::containers_in_network(&network_name);
+
+    if containers.is_err() {
+        panic!("Failed to fetch containers in network");
+    }
+
+    let mut vec_hosts = Vec::new();
+
+    for (_, container_info) in containers.unwrap() {
+        let add_host = format!(
+            "{}:{}",
+            container_info.name, container_info.ipv4_address_without_mask
+        );
+        vec_hosts.push(add_host);
+    }
+
+    let mut env: Vec<&str> = Vec::new();
+    let env_var = format!("REMOTE_URL=http://{container_name}");
+    env.push(&*env_var);
+
+    // Build the basic example, a function that calls the database
+    let build_result = build_with_env("./examples/node-fetch-network", env).await;
+
+    assert!(build_result.is_err());
+
+    stop_and_remove_container(container_name);
+    remove_network(network_name);
 }
 
 #[tokio::test]
@@ -673,10 +846,24 @@ async fn test_yarn_prisma() {
 }
 
 #[tokio::test]
-async fn test_pnpm() {
-    let name = simple_build("./examples/node-pnpm").await.unwrap();
+async fn test_pnpm_v8() {
+    let name = simple_build("./examples/node-pnpm-v8").await.unwrap();
     let output = run_image(&name, None).await;
-    assert!(output.contains("Hello from PNPM"));
+    assert!(output.contains("Hello from PNPM 8"));
+}
+
+#[tokio::test]
+async fn test_pnpm_v9() {
+    let name = simple_build("./examples/node-pnpm-v9").await.unwrap();
+    let output = run_image(&name, None).await;
+    assert!(output.contains("Hello from PNPM 9"));
+}
+
+#[tokio::test]
+async fn test_pnpm_corepack() {
+    let name = simple_build("./examples/node-pnpm-corepack").await.unwrap();
+    let output = run_image(&name, None).await;
+    assert!(output.contains("Hello from PNPM 9"));
 }
 
 #[tokio::test]
@@ -693,15 +880,6 @@ async fn test_bun_web_server() {
         .unwrap();
     let output = run_image(&name, None).await;
     assert!(output.contains("Hello from a Bun web server!"));
-}
-
-#[tokio::test]
-async fn test_pnpm_custom_version() {
-    let name = simple_build("./examples/node-pnpm-custom-node-version")
-        .await
-        .unwrap();
-    let output = run_image(&name, None).await;
-    assert!(output.contains("Hello from PNPM"));
 }
 
 #[tokio::test]
@@ -758,8 +936,50 @@ async fn test_python_asdf_poetry() {
     let name = simple_build("./examples/python-asdf-poetry").await.unwrap();
     let output = run_image(&name, None).await;
 
-    assert!(output.contains("3.12.3"), "{}", output);
+    assert!(output.contains("3.12.7"), "{}", output);
     assert!(output.contains("Poetry (version 1.8.2)"), "{}", output);
+}
+
+#[tokio::test]
+async fn test_python_psycopg2() -> Result<()> {
+    // Create the network
+    let n = create_network();
+    let network_name = n.name.clone();
+
+    // Create the postgres instance
+    let c = run_postgres();
+    let container_name = c.name.clone();
+
+    // Attach the postgres instance to the network
+    attach_container_to_network(n.name, container_name.clone());
+
+    let name = match simple_build("./examples/python-psycopg2").await {
+        Ok(name) => name,
+        Err(err) => {
+            // Cleanup containers and networks, and then error
+            stop_and_remove_container(container_name);
+            remove_network(network_name);
+            return Err(err);
+        }
+    };
+
+    let output = run_image(
+        &name,
+        Some(Config {
+            environment_variables: c.config.unwrap().environment_variables,
+            network: Some(network_name.clone()),
+        }),
+    )
+    .await;
+
+    println!("OUTPUT = {output}");
+
+    // Cleanup containers and networks
+    stop_and_remove_container(container_name);
+    remove_network(network_name);
+
+    assert!(output.contains("User inserted successfully with ID"));
+    Ok(())
 }
 
 #[tokio::test]
@@ -841,17 +1061,25 @@ async fn test_django_mysql() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_lunatic_basic() {
-    let name = simple_build("./examples/lunatic-basic").await.unwrap();
-    let output = run_image(&name, None).await;
-    assert!(output.contains("PING-PONG"));
-}
-
-#[tokio::test]
 async fn test_python_poetry() {
     let name = simple_build("./examples/python-poetry").await.unwrap();
     let output = run_image(&name, None).await;
     assert!(output.contains("Hello from Python-Poetry"));
+}
+
+#[tokio::test]
+async fn test_python_uv() {
+    let name = simple_build("./examples/python-uv").await.unwrap();
+    let output = run_image(&name, None).await;
+    assert!(output.contains("Hello from Python-Uv"));
+}
+
+// test dependencies which we special case to make it easier for users
+#[tokio::test]
+async fn test_python_deps() {
+    let name = simple_build("./examples/python-deps").await.unwrap();
+    let output = run_image(&name, None).await;
+    assert!(output.contains("Hello from python-deps"));
 }
 
 #[tokio::test]
@@ -901,7 +1129,7 @@ async fn test_rust_toolchain_file() {
         .await
         .unwrap();
     let output = run_image(&name, None).await;
-    assert!(output.contains("cargo 1.60.0-nightly"));
+    assert!(output.contains("cargo 1.82.0-nightly"));
 }
 
 #[tokio::test]
@@ -997,16 +1225,38 @@ async fn test_cowsay() {
     assert!(output.contains("Hello World"));
 }
 
-// This test is intentionally written to fail
 #[tokio::test]
 async fn test_docker_host() {
-    let name = Uuid::new_v4().to_string();
+    let env_name = Uuid::new_v4().to_string();
+    let arg_name = Uuid::new_v4().to_string();
+    let default_name = Uuid::new_v4().to_string();
+
+    // Case 1: Invalid Docker host in environment should fail
+    std::env::set_var("DOCKER_HOST", "tcp://0.0.0.0:2375");
     let result = create_docker_image(
         "./examples/shell-hello",
         Vec::new(),
         &GeneratePlanOptions::default(),
         &DockerBuilderOptions {
-            name: Some(name.clone()),
+            name: Some(env_name.clone()),
+            quiet: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(result.is_err());
+    let output = run_image(&env_name, None).await;
+    assert!(!output.contains("Hello World"));
+
+    // Case 2: Invalid Docker host in command arg should fail
+    std::env::remove_var("DOCKER_HOST");
+    let result = create_docker_image(
+        "./examples/shell-hello",
+        Vec::new(),
+        &GeneratePlanOptions::default(),
+        &DockerBuilderOptions {
+            name: Some(arg_name.clone()),
             quiet: true,
             docker_host: Some("tcp://0.0.0.0:2375".to_string()),
             docker_tls_verify: Some("0".to_string()),
@@ -1015,11 +1265,26 @@ async fn test_docker_host() {
     )
     .await;
 
-    // Expect the creation of the Docker image to fail
     assert!(result.is_err());
-
-    let output = run_image(&name, None).await;
+    let output = run_image(&arg_name, None).await;
     assert!(!output.contains("Hello World"));
+
+    // Case 3: No Docker host set should use default and succeed
+    let result = create_docker_image(
+        "./examples/shell-hello",
+        Vec::new(),
+        &GeneratePlanOptions::default(),
+        &DockerBuilderOptions {
+            name: Some(default_name.clone()),
+            quiet: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(result.is_ok());
+    let output = run_image(&default_name, None).await;
+    assert!(output.contains("Hello World"));
 }
 
 #[tokio::test]
@@ -1199,6 +1464,13 @@ async fn test_clojure() {
 }
 
 #[tokio::test]
+async fn test_clojure_luminus() {
+    let name = simple_build("./examples/clojure-luminus").await.unwrap();
+    let output = run_image(&name, None).await;
+    assert!(output.contains("clojure-luminus started successfully"));
+}
+
+#[tokio::test]
 async fn test_clojure_ring_app() {
     let name = simple_build("./examples/clojure-ring-app").await.unwrap();
     let output = run_image(&name, None).await;
@@ -1294,4 +1566,17 @@ async fn test_node_python() {
     let output = run_image(&name, None).await;
     assert!(output.contains("Node"));
     assert!(output.contains("Python"));
+}
+
+#[tokio::test]
+async fn test_config_toml_file() {
+    let name = simple_build("./examples/config-toml-file").await.unwrap();
+    let output = run_image(&name, None).await;
+    assert!(output.contains("hey there"));
+}
+
+#[tokio::test]
+async fn test_scheme() {
+    let name = simple_build("./examples/scheme").await.unwrap();
+    assert!(run_image(&name, None).await.contains("Hello from Scheme!"));
 }

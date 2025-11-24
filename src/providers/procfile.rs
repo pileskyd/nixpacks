@@ -14,8 +14,8 @@ use anyhow::{Context, Ok, Result};
 pub struct ProcfileProvider {}
 
 impl Provider for ProcfileProvider {
-    fn name(&self) -> &str {
-        "deno"
+    fn name(&self) -> &'static str {
+        "procfile"
     }
 
     fn get_build_plan(&self, app: &App, _env: &Environment) -> Result<Option<BuildPlan>> {
@@ -30,7 +30,7 @@ impl Provider for ProcfileProvider {
             ]);
             release.cmds = Some(vec!["...".to_string(), release_cmd]);
             plan.add_phase(release);
-        };
+        }
 
         if let Some(start_cmd) = ProcfileProvider::get_start_cmd(app)? {
             let start_phase = StartPhase::new(start_cmd);
@@ -52,8 +52,12 @@ impl ProcfileProvider {
                 Ok(None)
             } else if let Some(cmd) = procfile.get("web") {
                 Ok(Some(cmd.to_string()))
+            } else if let Some(cmd) = procfile.get("worker") {
+                Ok(Some(cmd.to_string()))
             } else {
-                let process = procfile.values().collect::<Vec<_>>()[0].to_string();
+                let mut processes: Vec<_> = procfile.iter().collect();
+                processes.sort_by_key(|&(key, _)| key);
+                let process = processes[0].1.to_string();
                 Ok(Some(process))
             }
         } else {

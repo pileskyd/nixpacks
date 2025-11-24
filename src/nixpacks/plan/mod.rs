@@ -18,7 +18,7 @@ pub mod merge;
 pub mod phase;
 pub mod pretty_print;
 mod topological_sort;
-mod utils;
+pub mod utils;
 
 /// Types that impl this trait can generate build plans.
 pub trait PlanGenerator {
@@ -264,9 +264,9 @@ impl BuildPlan {
             let mut install = Phase::install(Some(cmd_string));
 
             if let Some(cache_dirs) = env.get_config_variable("INSTALL_CACHE_DIRS") {
-                split_env_string(cache_dirs.as_str())
-                    .iter()
-                    .for_each(|dir| install.add_cache_directory(dir));
+                for dir in &split_env_string(cache_dirs.as_str()) {
+                    install.add_cache_directory(dir);
+                }
             }
 
             phases.push(install);
@@ -277,9 +277,9 @@ impl BuildPlan {
             let mut build = Phase::build(Some(cmd_string));
 
             if let Some(cache_dirs) = env.get_config_variable("BUILD_CACHE_DIRS") {
-                split_env_string(cache_dirs.as_str())
-                    .iter()
-                    .for_each(|dir| build.add_cache_directory(dir));
+                for dir in &split_env_string(cache_dirs.as_str()) {
+                    build.add_cache_directory(dir);
+                }
             }
 
             phases.push(build);
@@ -405,6 +405,47 @@ mod test {
         .unwrap();
 
         assert_eq!(result, env_plan);
+    }
+
+    #[test]
+    fn test_to_json_and_from_json() {
+        let original_plan = BuildPlan::from_toml(
+            r#"
+            [phases.setup]
+            nixPkgs = ["nodejs", "yarn"]
+            aptPkgs = ["git"]
+
+            [phases.install]
+            cmds = ["yarn install"]
+            cacheDirectories = ["node_modules"]
+            dependsOn = ["setup"]
+
+            [phases.build]
+            cmds = ["yarn build"]
+            dependsOn = ["install"]
+
+            [start]
+            cmd = "yarn start"
+            "#,
+        )
+        .unwrap();
+
+        let json_str = original_plan.to_json().unwrap();
+        let deserialized_plan = BuildPlan::from_json(json_str).unwrap();
+
+        assert_eq!(original_plan, deserialized_plan);
+        assert_eq!(
+            deserialized_plan.get_phase("setup").unwrap().nix_pkgs,
+            Some(vec!["nodejs".to_string(), "yarn".to_string()])
+        );
+        assert_eq!(
+            deserialized_plan.get_phase("setup").unwrap().apt_pkgs,
+            Some(vec!["git".to_string()])
+        );
+        assert_eq!(
+            deserialized_plan.start_phase.unwrap().cmd.unwrap(),
+            "yarn start".to_string()
+        );
     }
 
     #[test]

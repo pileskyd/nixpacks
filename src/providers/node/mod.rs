@@ -1,4 +1,4 @@
-use self::{moon::Moon, nx::Nx, turborepo::Turborepo};
+use self::{moon::Moon, nx::Nx, spa::SpaProvider, turborepo::Turborepo};
 use super::Provider;
 use crate::nixpacks::plan::merge::Mergeable;
 use crate::nixpacks::{
@@ -19,17 +19,27 @@ use std::collections::{HashMap, HashSet};
 
 mod moon;
 mod nx;
+mod spa;
 mod turborepo;
 
+// allows package manager versions to be updated without cutting a new nixpacks binary
 pub const NODE_OVERLAY: &str = "https://github.com/railwayapp/nix-npm-overlay/archive/main.tar.gz";
 
-const NODE_NIXPKGS_ARCHIVE: &str = "bdd2f439c62aa0b8aa97f5c784a965c23f968fe6";
-
-// We need to use a specific commit hash for Node versions <16 since it is EOL in the latest Nix packages
-const NODE_LT_16_ARCHIVE: &str = "bf744fe90419885eefced41b3e5ae442d732712d";
+// unlike package managers, {node,bun} versions are pinned to a particular nixpacks release
+const BUN_NIXPKGS_ARCHIVE: &str = "31fb21469e34b6b5c7be77b9a35bae43d0c598e9";
 
 const DEFAULT_NODE_VERSION: u32 = 18;
-const AVAILABLE_NODE_VERSIONS: &[u32] = &[14, 16, 18, 20, 22];
+
+// From: https://lazamar.co.uk/nix-versions/?channel=nixpkgs-unstable&package=nodejs
+// Maps Node version to nixpkgs archive hash
+const AVAILABLE_NODE_VERSIONS: &[(u32, &str)] = &[
+    (14, "bf744fe90419885eefced41b3e5ae442d732712d"), // EOL version, older nixpkgs
+    (16, "bf744fe90419885eefced41b3e5ae442d732712d"), // EOL version, older nixpkgs
+    (18, "ffeebf0acf3ae8b29f8c7049cd911b9636efd7e7"),
+    (20, "ffeebf0acf3ae8b29f8c7049cd911b9636efd7e7"),
+    (22, "e6f23dc08d3624daab7094b701aa3954923c6bbb"),
+    (24, "23f9169c4ccce521379e602cc82ed873a1f1b52b"),
+];
 
 const YARN_CACHE_DIR: &str = "/usr/local/share/.cache/yarn/v6";
 const PNPM_CACHE_DIR: &str = "/root/.local/share/pnpm/store/v3";
@@ -100,11 +110,27 @@ pub struct PackageJson {
     pub cache_directories: Option<Vec<String>>,
 }
 
+impl PackageJson {
+    /// searches dependencies and dev_dependencies in package.json for a given dependency
+    fn has_dependency(&self, dep: &str) -> bool {
+        if let Some(deps) = &self.dependencies {
+            if deps.contains_key(dep) {
+                return true;
+            }
+        } else if let Some(deps) = &self.dev_dependencies {
+            if deps.contains_key(dep) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct NodeProvider {}
 
 impl Provider for NodeProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "node"
     }
 
@@ -116,7 +142,6 @@ impl Provider for NodeProvider {
         // Setup
         let mut setup = Phase::setup(Some(NodeProvider::get_nix_packages(app, env)?));
         setup.set_nix_archive(NodeProvider::get_nix_archive(app)?);
-
         if NodeProvider::uses_node_dependency(app, "prisma") {
             setup.add_nix_pkgs(&[Pkg::new("openssl")]);
         }
@@ -133,12 +158,13 @@ impl Provider for NodeProvider {
                 "libatk-bridge2.0-0".to_string(),
                 "libcups2".to_string(),
                 "libgbm1".to_string(),
-                "libasound2".to_string(),
+                "libasound2t64".to_string(),
                 "libpangocairo-1.0-0".to_string(),
                 "libxss1".to_string(),
                 "libgtk-3-0".to_string(),
                 "libxshmfence1".to_string(),
                 "libglu1".to_string(),
+                "chromium".to_string(),
             ]);
         }
 
@@ -203,9 +229,24 @@ impl Provider for NodeProvider {
         // Start
         let start = NodeProvider::get_start_cmd(app, env)?.map(StartPhase::new);
 
-        let mut plan = BuildPlan::new(&vec![setup, install, build], start);
-        plan.add_variables(NodeProvider::get_node_environment_variables());
+        let mut phases = vec![setup, install, build];
+        if let Some(caddy) = SpaProvider::caddy_phase(app, env) {
+            phases.push(caddy);
+        }
+        let is_spa = SpaProvider::is_spa(app);
 
+        let mut plan = BuildPlan::new(&phases, start);
+        if SpaProvider::caddy_phase(app, env).is_some() {
+            plan.add_static_assets(SpaProvider::static_assets());
+        }
+        plan.add_variables(NodeProvider::get_node_environment_variables());
+        if is_spa {
+            plan.add_variables(EnvironmentVariables::from([(
+                "NIXPACKS_SPA_OUTPUT_DIR".to_string(),
+                env.get_config_variable("SPA_OUT_DIR")
+                    .unwrap_or(SpaProvider::get_output_directory(app)),
+            )]));
+        }
         Ok(Some(plan))
     }
 }
@@ -215,6 +256,7 @@ impl NodeProvider {
         EnvironmentVariables::from([
             ("NODE_ENV".to_string(), "production".to_string()),
             ("NPM_CONFIG_PRODUCTION".to_string(), "false".to_string()),
+            // CI required for various node tooling
             ("CI".to_string(), "true".to_string()),
         ])
     }
@@ -298,6 +340,10 @@ impl NodeProvider {
             }
         }
 
+        if let Some(start) = SpaProvider::start_command(app, env) {
+            return Ok(Some(start));
+        }
+
         let package_manager = NodeProvider::get_package_manager(app);
         if NodeProvider::has_script(app, "start")? {
             return Ok(Some(format!("{package_manager} run start")));
@@ -334,12 +380,23 @@ impl NodeProvider {
 
         let nvmrc_node_version = if app.includes_file(".nvmrc") {
             let nvmrc = app.read_file(".nvmrc")?;
-            Some(nvmrc.trim().replace('v', ""))
+            Some(parse_nvmrc(&nvmrc))
         } else {
             None
         };
 
-        let node_version = env_node_version.or(pkg_node_version).or(nvmrc_node_version);
+        let dot_node_version = if app.includes_file(".node-version") {
+            let node_version_file = app.read_file(".node-version")?;
+            // Using simple string transform since .node-version don't currently have a convention around the use of lts/* implemented in parse_nvmrc method
+            Some(node_version_file.trim().replace('v', ""))
+        } else {
+            None
+        };
+
+        let node_version = env_node_version
+            .or(pkg_node_version)
+            .or(nvmrc_node_version)
+            .or(dot_node_version);
 
         let node_version = match node_version {
             Some(node_version) => node_version,
@@ -352,19 +409,39 @@ impl NodeProvider {
         }
 
         let node_pkg = parse_node_version_into_pkg(&node_version);
-        return Ok(Pkg::new(node_pkg.as_str()));
+        Ok(Pkg::new(node_pkg.as_str()))
     }
 
     pub fn get_package_manager(app: &App) -> String {
-        let mut pkg_manager = "npm";
-        if app.includes_file("pnpm-lock.yaml") {
-            pkg_manager = "pnpm";
-        } else if app.includes_file("yarn.lock") {
-            pkg_manager = "yarn";
-        } else if app.includes_file("bun.lockb") {
-            pkg_manager = "bun";
+        // Checks for the package manager in root's package.json
+        let package_json: PackageJson = app.read_json("package.json").unwrap_or_default();
+
+        // Attempt to identify the package manager from `package.json`
+        if let Some(pkg) = package_json
+            .package_manager
+            .as_deref()
+            .and_then(|p| p.split('@').next())
+        {
+            if matches!(pkg, "npm" | "pnpm" | "yarn" | "bun") {
+                return pkg.to_string();
+            }
         }
-        pkg_manager.to_string()
+
+        // Check for lockfiles to infer the package manager
+        if app.includes_file("pnpm-lock.yaml") {
+            return "pnpm".to_string();
+        }
+
+        if app.includes_file("yarn.lock") {
+            return "yarn".to_string();
+        }
+
+        if app.includes_file("bun.lockb") || app.includes_file("bun.lock") {
+            return "bun".to_string();
+        }
+
+        // fallbacks to npm
+        "npm".to_string()
     }
 
     pub fn get_package_manager_dlx_command(app: &App) -> String {
@@ -396,7 +473,7 @@ impl NodeProvider {
             }
         } else if app.includes_file("package-lock.json") {
             install_cmd = "npm ci".to_string();
-        } else if app.includes_file("bun.lockb") {
+        } else if app.includes_file("bun.lockb") || app.includes_file("bun.lock") {
             install_cmd = "bun i --no-save".to_string();
         }
 
@@ -429,14 +506,29 @@ impl NodeProvider {
     /// Returns the Nix archive to use for the Node and related packages
     pub fn get_nix_archive(app: &App) -> Result<String> {
         let package_json: PackageJson = app.read_json("package.json").unwrap_or_default();
+        let package_manager = NodeProvider::get_package_manager(app);
         let node_pkg = NodeProvider::get_nix_node_pkg(&package_json, app, &Environment::default())?;
-        let uses_le_16 = node_pkg.name.contains("14") || node_pkg.name.contains("16");
 
-        if uses_le_16 {
-            Ok(NODE_LT_16_ARCHIVE.to_string())
-        } else {
-            Ok(NODE_NIXPKGS_ARCHIVE.to_string())
+        // Bun uses a separate archive
+        if package_manager == "bun" {
+            return Ok(BUN_NIXPKGS_ARCHIVE.to_string());
         }
+
+        // Extract version number from package name (e.g., "nodejs_18" -> 18)
+        let version = node_pkg
+            .name
+            .strip_prefix("nodejs_")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_NODE_VERSION);
+
+        // Look up the archive for this version
+        let archive = version_number_to_archive(version).unwrap_or_else(|| {
+            // Fallback to default version's archive
+            version_number_to_archive(DEFAULT_NODE_VERSION)
+                .expect("Default node version must exist in AVAILABLE_NODE_VERSIONS")
+        });
+
+        Ok(archive.to_string())
     }
 
     /// Returns the nodejs nix package and the appropriate package manager nix image.
@@ -455,16 +547,35 @@ impl NodeProvider {
         pkgs.push(node_pkg);
 
         if package_manager == "pnpm" {
-            let lockfile = app.read_file("pnpm-lock.yaml").unwrap_or_default();
-            if lockfile.starts_with("lockfileVersion: 5.3") {
-                pm_pkg = Pkg::new("pnpm-6_x");
-            } else if lockfile.starts_with("lockfileVersion: 5.4") {
-                pm_pkg = Pkg::new("pnpm-7_x");
+            // First, try to determine version from packageManager field (for corepack)
+            if let Some(ref pkg_manager_field) = package_json.package_manager {
+                if let Some(version_str) = pkg_manager_field.strip_prefix("pnpm@") {
+                    // Parse major version from "pnpm@9.0.3" -> 9
+                    if let Some(major_version) = version_str.split('.').next() {
+                        if let Ok(major) = major_version.parse::<u32>() {
+                            pm_pkg = match major {
+                                6 => Pkg::new("pnpm-6_x"),
+                                7 => Pkg::new("pnpm-7_x"),
+                                8 => Pkg::new("pnpm-8_x"),
+                                9 => Pkg::new("pnpm-9_x"),
+                                10 => Pkg::new("pnpm-10_x"),
+                                _ => {
+                                    // For unknown versions, try lockfile detection
+                                    NodeProvider::get_pnpm_package_from_lockfile(app)
+                                }
+                            };
+                        } else {
+                            pm_pkg = NodeProvider::get_pnpm_package_from_lockfile(app);
+                        }
+                    } else {
+                        pm_pkg = NodeProvider::get_pnpm_package_from_lockfile(app);
+                    }
+                } else {
+                    pm_pkg = NodeProvider::get_pnpm_package_from_lockfile(app);
+                }
             } else {
-                // pnpm v8 uses lockfile v6 as default, it appears as
-                // lockfileVersion: '6.0'
-                // in the lockfile. Take the quotes into account in the future.
-                pm_pkg = Pkg::new("pnpm-8_x");
+                // Fall back to lockfile-based detection
+                pm_pkg = NodeProvider::get_pnpm_package_from_lockfile(app);
             }
         } else if package_manager == "yarn" {
             pm_pkg = Pkg::new("yarn-1_x");
@@ -481,7 +592,7 @@ impl NodeProvider {
                 // npm v9 uses lockfile v3 as default
                 pm_pkg = Pkg::new("npm-9_x");
             }
-        };
+        }
         pkgs.push(pm_pkg.from_overlay(NODE_OVERLAY));
 
         Ok(pkgs)
@@ -573,6 +684,20 @@ impl NodeProvider {
         all_deps
     }
 
+    fn get_pnpm_package_from_lockfile(app: &App) -> Pkg {
+        let lockfile = app.read_file("pnpm-lock.yaml").unwrap_or_default();
+        if lockfile.starts_with("lockfileVersion: 5.3") {
+            Pkg::new("pnpm-6_x")
+        } else if lockfile.starts_with("lockfileVersion: 5.4") {
+            Pkg::new("pnpm-7_x")
+        } else if lockfile.starts_with("lockfileVersion: '6.0'") {
+            Pkg::new("pnpm-8_x")
+        } else {
+            // lockfileVersion '9.0' and unknown versions default to pnpm 9
+            Pkg::new("pnpm-9_x")
+        }
+    }
+
     pub fn cache_tsbuildinfo_file(app: &App, build: &mut Phase) {
         let mut ts_config: TsConfigJson = app.read_json("tsconfig.json").unwrap_or_default();
         if let Some(ref extends) = ts_config.extends {
@@ -604,12 +729,23 @@ impl NodeProvider {
                     }
                 }
             }
-        };
+        }
     }
 }
 
+fn version_number_to_archive(version: u32) -> Option<&'static str> {
+    AVAILABLE_NODE_VERSIONS
+        .iter()
+        .find(|(ver, _archive)| *ver == version)
+        .map(|(_ver, archive)| *archive)
+}
+
 fn version_number_to_pkg(version: u32) -> String {
-    if AVAILABLE_NODE_VERSIONS.contains(&version) {
+    let version_exists = AVAILABLE_NODE_VERSIONS
+        .iter()
+        .any(|(ver, _archive)| *ver == version);
+
+    if version_exists {
         format!("nodejs_{version}")
     } else {
         format!("nodejs_{DEFAULT_NODE_VERSION}")
@@ -619,13 +755,18 @@ fn version_number_to_pkg(version: u32) -> String {
 fn parse_node_version_into_pkg(node_version: &str) -> String {
     let default_node_pkg_name = version_number_to_pkg(DEFAULT_NODE_VERSION);
     let range: Range = node_version.parse().unwrap_or_else(|_| {
-        println!("Warning: node version {node_version} is not valid, using default node version {default_node_pkg_name}");
+        eprintln!("Warning: node version {node_version} is not valid, using default node version {default_node_pkg_name}");
         Range::parse(DEFAULT_NODE_VERSION.to_string()).unwrap()
     });
-    let mut available_node_versions = AVAILABLE_NODE_VERSIONS.to_vec();
+    let mut available_lts_node_versions = AVAILABLE_NODE_VERSIONS
+        .iter()
+        .map(|(ver, _archive)| *ver)
+        .filter(|v| v % 2 == 0)
+        .collect::<Vec<u32>>();
+
     // use newest node version first
-    available_node_versions.sort_by(|a, b| b.cmp(a));
-    for version_number in available_node_versions {
+    available_lts_node_versions.sort_by(|a, b| b.cmp(a));
+    for version_number in available_lts_node_versions {
         let version_range_string = format!("{version_number}.x.x");
         let version_range: Range = version_range_string.parse().unwrap();
         if version_range.allows_any(&range) {
@@ -633,6 +774,35 @@ fn parse_node_version_into_pkg(node_version: &str) -> String {
         }
     }
     default_node_pkg_name
+}
+
+fn parse_nvmrc(nvmrc_content: &str) -> String {
+    let lts_versions: HashMap<&str, u32> = {
+        let mut nvm_map = HashMap::new();
+        nvm_map.insert("lts/*", 22);
+        nvm_map.insert("lts/jod", 22);
+        nvm_map.insert("lts/argon", 4);
+        nvm_map.insert("lts/boron", 6);
+        nvm_map.insert("lts/carbon", 8);
+        nvm_map.insert("lts/dubnium", 10);
+        nvm_map.insert("lts/erbium", 12);
+        nvm_map.insert("lts/fermium", 14);
+        nvm_map.insert("lts/gallium", 16);
+        nvm_map.insert("lts/hydrogen", 18);
+        nvm_map.insert("lts/iron", 20);
+        nvm_map
+    };
+
+    let trimmed_version = nvmrc_content.trim();
+    if let Some(&version) = lts_versions.get(trimmed_version) {
+        return version.to_string();
+    }
+
+    // Only remove v if it is in the starting character, lts/ will never have that in starting
+    trimmed_version
+        .strip_prefix('v')
+        .unwrap_or(trimmed_version)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -675,6 +845,24 @@ mod test {
                 &Environment::default()
             )?,
             Pkg::new(version_number_to_pkg(DEFAULT_NODE_VERSION).as_str())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_latest_lts_version() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_nix_node_pkg(
+                &PackageJson {
+                    name: Some(String::default()),
+                    engines: Some(engines_node(">=18")),
+                    ..Default::default()
+                },
+                &App::new("examples/node")?,
+                &Environment::default()
+            )?,
+            Pkg::new(version_number_to_pkg(24).as_str())
         );
 
         Ok(())
@@ -932,6 +1120,57 @@ mod test {
     }
 
     #[test]
+    fn test_version_from_node_version_file() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_nix_node_pkg(
+                &PackageJson {
+                    name: Some(String::default()),
+                    ..Default::default()
+                },
+                &App::new("examples/node-node-version")?,
+                &Environment::default()
+            )?,
+            Pkg::new("nodejs_22")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_version_from_nvmrc_lts() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_nix_node_pkg(
+                &PackageJson {
+                    name: Some(String::default()),
+                    ..Default::default()
+                },
+                &App::new("examples/node-nvmrc-lts")?,
+                &Environment::default()
+            )?,
+            Pkg::new("nodejs_20")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_version_from_nvmrc_lts() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_nix_node_pkg(
+                &PackageJson {
+                    name: Some(String::default()),
+                    ..Default::default()
+                },
+                &App::new("examples/node-nvmrc-invalid-lts")?,
+                &Environment::default()
+            )?,
+            Pkg::new("nodejs_18")
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_engine_invalid_version() -> Result<()> {
         // this test now defaults to lts
         assert_eq!(
@@ -962,6 +1201,26 @@ mod test {
                 "./examples/node-monorepo/packages/client"
             )?)?,
             vec![String::new()]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_correct_package_manager_monorepo_root() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_package_manager(&App::new("examples/node-pnpm-monorepo")?),
+            "pnpm"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_correct_package_manager_monorepo_subpkg() -> Result<()> {
+        assert_eq!(
+            NodeProvider::get_package_manager(&App::new("examples/node-pnpm-monorepo/apps/docs")?),
+            "pnpm"
         );
 
         Ok(())
